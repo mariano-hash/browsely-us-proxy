@@ -1,118 +1,67 @@
+// runtime-shim.js
 (function () {
-  if (window.__BROWSELY_SHIM_INSTALLED__) return;
-  window.__BROWSELY_SHIM_INSTALLED__ = true;
+  try {
+    var BASE = (window.__BROWSELY__ && window.__BROWSELY__.base) || location.href;
+    var b64u = function (s) {
+      return btoa(unescape(encodeURIComponent(s)))
+        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    };
+    var abs = function (u) { try { return new URL(u, BASE).toString(); } catch (e) { return null; } };
+    var skip = function (u) {
+      return !u || /^(data:|blob:|javascript:|about:|mailto:|tel:|#|vbscript:)/i.test(String(u).trim());
+    };
+    var toDoc = function (u) {
+      if (skip(u)) return u;
+      var a = abs(u); return a ? "/p/" + b64u(a) : u;
+    };
+    var toAsset = function (u) {
+      if (skip(u)) return u;
+      var a = abs(u); return a ? "/a/" + b64u(a) : u;
+    };
 
-  var BASE = window.__BROWSELY_BASE_URL__ || location.href;
-  var ORIGIN = location.origin;
-
-  function isInternal(u) {
-    if (!u) return true;
-    if (u.indexOf(ORIGIN + "/proxy") === 0) return true;
-    if (u.indexOf(ORIGIN + "/asset") === 0) return true;
-    if (u.indexOf("/proxy?") === 0 || u === "/proxy") return true;
-    if (u.indexOf("/asset?") === 0 || u === "/asset") return true;
-    if (u.charAt(0) === "#") return true;
-    if (u.indexOf("javascript:") === 0) return true;
-    if (u.indexOf("mailto:") === 0) return true;
-    if (u.indexOf("tel:") === 0) return true;
-    if (u.indexOf("data:") === 0) return true;
-    if (u.indexOf("blob:") === 0) return true;
-    return false;
-  }
-
-  function toProxy(u) {
-    try {
-      if (u == null) return u;
-      var s = String(u);
-      if (isInternal(s)) return s;
-      var abs = new URL(s, BASE).href;
-      return "/proxy?url=" + encodeURIComponent(abs);
-    } catch (e) {
-      return u;
-    }
-  }
-
-  // --- Click delegation: catches <a> added by JS after page load ---
-  document.addEventListener(
-    "click",
-    function (e) {
-      if (e.defaultPrevented) return;
-      if (e.button !== 0) return; // left click only
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-      var t = e.target;
-      var a = t && t.closest ? t.closest("a[href]") : null;
+    // intercept clicks on links the rewriter may have missed (e.g. JS-built)
+    document.addEventListener("click", function (e) {
+      var a = e.target && e.target.closest && e.target.closest("a[href]");
       if (!a) return;
       var href = a.getAttribute("href");
-      if (!href || isInternal(href)) return;
-      var target = a.getAttribute("target");
-      if (target && target !== "_self") return; // _blank etc. flows through window.open
+      if (skip(href)) return;
+      if (/^\/(p|a)\//.test(href)) return;
       e.preventDefault();
-      window.location.href = toProxy(href);
-    },
-    true
-  );
+      location.href = toDoc(href);
+    }, true);
 
-  // --- Submit delegation: catches GET forms created by JS ---
-  document.addEventListener(
-    "submit",
-    function (e) {
+    // form submissions
+    document.addEventListener("submit", function (e) {
       var f = e.target;
       if (!f || f.tagName !== "FORM") return;
-      var method = (f.getAttribute("method") || "GET").toUpperCase();
-      if (method !== "GET") return; // POST forms already rewritten server-side
       var action = f.getAttribute("action") || BASE;
-      if (isInternal(action)) return;
-      try {
-        var abs = new URL(action, BASE).href;
-        f.setAttribute("method", "POST");
-        f.setAttribute("action", "/proxy");
-        if (!f.querySelector('input[name="url"]')) {
-          var hidden = document.createElement("input");
-          hidden.type = "hidden";
-          hidden.name = "url";
-          hidden.value = abs;
-          f.insertBefore(hidden, f.firstChild);
-        }
-      } catch (err) {
-        /* let it submit as-is */
+      if (/^\/(p|a)\//.test(action)) return;
+      var absAction = abs(action);
+      if (!absAction) return;
+      if ((f.method || "GET").toUpperCase() === "GET") {
+        e.preventDefault();
+        var params = new URLSearchParams(new FormData(f)).toString();
+        var sep = absAction.indexOf("?") >= 0 ? "&" : "?";
+        location.href = "/p/" + b64u(absAction + (params ? sep + params : ""));
+      } else {
+        f.setAttribute("action", "/p/" + b64u(absAction));
       }
-    },
-    true
-  );
+    }, true);
 
-  // --- Location.assign / Location.replace ---
-  try {
-    var origAssign = Location.prototype.assign;
-    var origReplace = Location.prototype.replace;
-    Location.prototype.assign = function (u) {
-      return origAssign.call(this, toProxy(u));
-    };
-    Location.prototype.replace = function (u) {
-      return origReplace.call(this, toProxy(u));
-    };
-  } catch (e) {}
+    // location.assign / replace
+    try {
+      var _a = Location.prototype.assign, _r = Location.prototype.replace;
+      Location.prototype.assign  = function (u) { return _a.call(this, toDoc(u)); };
+      Location.prototype.replace = function (u) { return _r.call(this, toDoc(u)); };
+    } catch (e) {}
 
-  // --- location.href setter (best-effort) ---
-  try {
-    var desc = Object.getOwnPropertyDescriptor(Location.prototype, "href");
-    if (desc && desc.configurable && desc.set) {
-      var origSet = desc.set;
-      Object.defineProperty(Location.prototype, "href", {
-        configurable: true,
-        enumerable: true,
-        get: desc.get,
-        set: function (v) {
-          return origSet.call(this, toProxy(v));
-        },
-      });
-    }
-  } catch (e) {}
-
-  // --- window.open ---
-  try {
-    var origOpen = window.open;
-    window.open = function (u, name, features) {
-      return origOpen.call(window, u ? toProxy(u) : u, name, features);
+    // window.open → same frame, proxied
+    var _open = window.open;
+    window.open = function (u, n, f) {
+      try { u = toDoc(u); n = "_self"; } catch (e) {}
+      return _open ? _open.call(window, u, n, f) : null;
     };
-  } catch (e) {}
+  } catch (e) {
+    console.error("[Browsely shim] init failed", e);
+  }
 })();
