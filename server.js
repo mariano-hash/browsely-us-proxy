@@ -1,280 +1,288 @@
+// server.js — Browsely US Proxy (minimal safe navigation patch)
 import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
 import * as cheerio from "cheerio";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const RUNTIME_SHIM = readFileSync(join(__dirname, "runtime-shim.js"), "utf8");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+// --- CORS (open; tighten later if desired) ---
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Range, Accept, Accept-Language, User-Agent"
+  );
+  res.set(
+    "Access-Control-Expose-Headers",
+    "Content-Length, Content-Range, Accept-Ranges, Content-Type"
+  );
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-function normalizeUrl(input) {
-  if (!input) throw new Error("Missing URL");
+// Body parsing for POSTed forms (GET-form → POST conversion)
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-  let url = String(input).trim();
+// --- Health ---
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "Browsely US Proxy", media: true });
+});
 
-  if (!/^https?:\/\//i.test(url)) {
-    url = "https://" + url;
-  }
+// --- Helpers ---
+const DEFAULT_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-  const parsed = new URL(url);
-
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("Only http and https URLs are allowed");
-  }
-
-  const hostname = parsed.hostname.toLowerCase();
-
-  if (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname.startsWith("10.") ||
-    hostname.startsWith("192.168.") ||
-    hostname.startsWith("172.16.")
-  ) {
-    throw new Error("Blocked private/internal URL");
-  }
-
-  return parsed;
+function buildForwardHeaders(req) {
+  const h = {
+    "user-agent": req.get("user-agent") || DEFAULT_UA,
+    accept: req.get("accept") || "*/*",
+    "accept-language": req.get("accept-language") || "en-US,en;q=0.9",
+  };
+  const range = req.get("range");
+  if (range) h["range"] = range;
+  return h;
 }
 
-function proxifyUrl(url) {
-  return `/proxy?url=${encodeURIComponent(url)}`;
-}
-
-function assetUrl(url) {
-  return `/asset?url=${encodeURIComponent(url)}`;
-}
-
-function rewriteCssUrls(css, baseUrl) {
-  return css.replace(/url\(([^)]+)\)/gi, (match, raw) => {
-    let cleaned = raw.trim().replace(/^['"]|['"]$/g, "");
-
-    if (
-      cleaned.startsWith("data:") ||
-      cleaned.startsWith("javascript:") ||
-      cleaned.startsWith("#")
-    ) {
-      return match;
-    }
-
-    try {
-      const absolute = new URL(cleaned, baseUrl).href;
-      return `url("${assetUrl(absolute)}")`;
-    } catch {
-      return match;
-    }
-  });
-}
-
-function rewriteSrcset(value, baseUrl) {
-  return value
-    .split(",")
-    .map((part) => {
-      const pieces = part.trim().split(/\s+/);
-      if (!pieces[0]) return part;
-
-      try {
-        const absolute = new URL(pieces[0], baseUrl).href;
-        pieces[0] = assetUrl(absolute);
-        return pieces.join(" ");
-      } catch {
-        return part;
-      }
-    })
-    .join(", ");
-}
-
-function copyHeaders(from, to) {
-  const allowed = [
+function passthroughHeaders(srcHeaders, res) {
+  const keep = [
     "content-type",
     "content-length",
     "accept-ranges",
     "content-range",
     "cache-control",
+    "etag",
     "last-modified",
-    "etag"
   ];
-
-  for (const header of allowed) {
-    const value = from.headers.get(header);
-    if (value) to.setHeader(header, value);
+  for (const k of keep) {
+    const v = srcHeaders.get(k);
+    if (v) res.set(k, v);
   }
 }
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Browsely US Proxy",
-    media: true
-  });
-});
-
-app.get("/asset", async (req, res) => {
+function absolutize(target, base) {
   try {
-    const target = normalizeUrl(req.query.url);
+    return new URL(target, base).href;
+  } catch {
+    return null;
+  }
+}
 
-    const headers = {
-      "User-Agent":
-        req.headers["user-agent"] ||
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BrowselyProxy/1.0",
-      Accept: req.headers.accept || "*/*"
-    };
-
-    if (req.headers.range) {
-      headers.Range = req.headers.range;
+async function streamUpstream(upstream, res) {
+  res.status(upstream.status);
+  passthroughHeaders(upstream.headers, res);
+  if (!upstream.body) return res.end();
+  const reader = upstream.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
     }
+  } catch {
+    /* client disconnected */
+  }
+  res.end();
+}
 
-    if (req.headers["accept-language"]) {
-      headers["Accept-Language"] = req.headers["accept-language"];
-    }
-
-    const response = await fetch(target.href, {
-      headers,
-      redirect: "follow"
+// --- /asset — binary/media/css/js passthrough, preserves Range ---
+app.get("/asset", async (req, res) => {
+  const url = req.query.url;
+  if (!url || typeof url !== "string")
+    return res.status(400).send("Missing url");
+  try {
+    const upstream = await fetch(url, {
+      headers: buildForwardHeaders(req),
+      redirect: "follow",
     });
-
-    res.status(response.status);
-    copyHeaders(response, res);
-
-    if (!res.getHeader("content-type")) {
-      res.setHeader("content-type", "application/octet-stream");
-    }
-
-    response.body.pipe(res);
-  } catch (err) {
-    res.status(400).json({
-      ok: false,
-      route: "asset",
-      error: err.message
-    });
+    await streamUpstream(upstream, res);
+  } catch (e) {
+    res.status(502).send("Asset fetch failed: " + e.message);
   }
 });
 
-app.get("/proxy", async (req, res) => {
+// --- /proxy — HTML pages (and any non-asset GET).
+// Accepts GET ?url=... or POST (urlencoded) with `url` + extra form fields.
+async function handleProxy(req, res) {
+  let targetUrl = req.query.url || (req.body && req.body.url);
+  if (!targetUrl)
+    return res
+      .status(400)
+      .send("Cannot GET " + req.originalUrl + " — missing url parameter");
+
+  // POST (converted GET form): append remaining body fields as query on target
+  if (req.method === "POST" && req.body && typeof req.body === "object") {
+    const extras = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.body)) {
+      if (k === "url") continue;
+      if (Array.isArray(v)) v.forEach((vv) => extras.append(k, String(vv)));
+      else extras.append(k, String(v));
+    }
+    const qs = extras.toString();
+    if (qs) targetUrl += (targetUrl.includes("?") ? "&" : "?") + qs;
+  }
+
+  // GET: forward extra query params (besides `url`) to target
+  if (req.method === "GET") {
+    const extras = new URLSearchParams();
+    for (const [k, v] of Object.entries(req.query)) {
+      if (k === "url") continue;
+      if (Array.isArray(v)) v.forEach((vv) => extras.append(k, String(vv)));
+      else extras.append(k, String(v));
+    }
+    const qs = extras.toString();
+    if (qs) targetUrl += (targetUrl.includes("?") ? "&" : "?") + qs;
+  }
+
   try {
-    const target = normalizeUrl(req.query.url);
-
-    const headers = {
-      "User-Agent":
-        req.headers["user-agent"] ||
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BrowselyProxy/1.0",
-      Accept:
-        req.headers.accept ||
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    };
-
-    if (req.headers["accept-language"]) {
-      headers["Accept-Language"] = req.headers["accept-language"];
-    }
-
-    if (req.headers.range) {
-      headers.Range = req.headers.range;
-    }
-
-    const response = await fetch(target.href, {
-      headers,
-      redirect: "follow"
+    const upstream = await fetch(targetUrl, {
+      method: "GET",
+      headers: buildForwardHeaders(req),
+      redirect: "manual",
     });
 
-    const contentType = response.headers.get("content-type") || "";
+    // Manual redirect: rewrite Location through /proxy
+    if (upstream.status >= 300 && upstream.status < 400) {
+      const loc = upstream.headers.get("location");
+      if (loc) {
+        const abs = absolutize(loc, targetUrl);
+        if (abs) {
+          res.redirect(
+            upstream.status,
+            "/proxy?url=" + encodeURIComponent(abs)
+          );
+          return;
+        }
+      }
+    }
 
-    if (!contentType.includes("text/html")) {
-      res.status(response.status);
-      copyHeaders(response, res);
-      response.body.pipe(res);
+    const ctype = upstream.headers.get("content-type") || "";
+
+    // Non-HTML → stream through
+    if (!ctype.includes("text/html")) {
+      await streamUpstream(upstream, res);
       return;
     }
 
-    let html = await response.text();
-    const $ = cheerio.load(html);
-
-    $("base").remove();
-
-    $("a[href]").each((_, el) => {
-      const href = $(el).attr("href");
-
-      if (!href || href.startsWith("#") || href.startsWith("javascript:")) {
-        return;
-      }
-
-      try {
-        const absolute = new URL(href, target.href).href;
-        $(el).attr("href", proxifyUrl(absolute));
-      } catch {}
-    });
-
-    $(
-      "img[src], script[src], iframe[src], source[src], video[src], audio[src], track[src], embed[src], object[data]"
-    ).each((_, el) => {
-      const tag = el.tagName?.toLowerCase();
-      const attr = tag === "object" ? "data" : "src";
-      const value = $(el).attr(attr);
-
-      if (!value || value.startsWith("data:") || value.startsWith("javascript:")) {
-        return;
-      }
-
-      try {
-        const absolute = new URL(value, target.href).href;
-        $(el).attr(attr, assetUrl(absolute));
-      } catch {}
-    });
-
-    $("link[href]").each((_, el) => {
-      const href = $(el).attr("href");
-
-      if (!href || href.startsWith("javascript:")) return;
-
-      try {
-        const absolute = new URL(href, target.href).href;
-        $(el).attr("href", assetUrl(absolute));
-      } catch {}
-    });
-
-    $("[srcset]").each((_, el) => {
-      const srcset = $(el).attr("srcset");
-      if (srcset) {
-        $(el).attr("srcset", rewriteSrcset(srcset, target.href));
-      }
-    });
-
-    $("[poster]").each((_, el) => {
-      const poster = $(el).attr("poster");
-      if (poster) {
-        try {
-          const absolute = new URL(poster, target.href).href;
-          $(el).attr("poster", assetUrl(absolute));
-        } catch {}
-      }
-    });
-
-    $("form").each((_, el) => {
-      $(el).attr("method", "GET");
-      $(el).attr("action", proxifyUrl(target.href));
-    });
-
-    $("style").each((_, el) => {
-      const css = $(el).html();
-      if (css) {
-        $(el).html(rewriteCssUrls(css, target.href));
-      }
-    });
-
-    html = $.html();
-
-    res.status(response.status);
-    res.setHeader("content-type", "text/html; charset=utf-8");
-    res.send(html);
-  } catch (err) {
-    res.status(400).json({
-      ok: false,
-      route: "proxy",
-      error: err.message
-    });
+    // HTML → rewrite + inject shim
+    const html = await upstream.text();
+    const rewritten = rewriteHtml(html, targetUrl);
+    res.status(upstream.status);
+    res.set("content-type", "text/html; charset=utf-8");
+    res.send(rewritten);
+  } catch (e) {
+    res.status(502).send("Proxy fetch failed: " + e.message);
   }
-});
+}
+
+app.get("/proxy", handleProxy);
+app.post("/proxy", handleProxy);
+
+// --- HTML rewriter ---
+function rewriteHtml(html, baseUrl) {
+  const $ = cheerio.load(html, { decodeEntities: false });
+
+  const toProxy = (u) => {
+    const abs = absolutize(u, baseUrl);
+    if (!abs) return u;
+    return "/proxy?url=" + encodeURIComponent(abs);
+  };
+  const toAsset = (u) => {
+    const abs = absolutize(u, baseUrl);
+    if (!abs) return u;
+    return "/asset?url=" + encodeURIComponent(abs);
+  };
+
+  // Links
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (
+      !href ||
+      href.startsWith("#") ||
+      href.startsWith("javascript:") ||
+      href.startsWith("mailto:") ||
+      href.startsWith("tel:")
+    )
+      return;
+    $(el).attr("href", toProxy(href));
+  });
+
+  // Media / assets
+  $(
+    "img[src], video[src], audio[src], source[src], track[src], script[src], iframe[src]"
+  ).each((_, el) => {
+    const src = $(el).attr("src");
+    if (src) $(el).attr("src", toAsset(src));
+  });
+  $("video[poster]").each((_, el) => {
+    const p = $(el).attr("poster");
+    if (p) $(el).attr("poster", toAsset(p));
+  });
+  $("link[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (href) $(el).attr("href", toAsset(href));
+  });
+  $("[srcset]").each((_, el) => {
+    const ss = $(el).attr("srcset");
+    if (!ss) return;
+    const out = ss
+      .split(",")
+      .map((part) => {
+        const seg = part.trim().split(/\s+/);
+        if (!seg[0]) return part;
+        seg[0] = toAsset(seg[0]);
+        return seg.join(" ");
+      })
+      .join(", ");
+    $(el).attr("srcset", out);
+  });
+
+  // --- KEY FIX: forms ---
+  // GET forms → POST /proxy with hidden `url`, so browser can't strip ?url=.
+  // POST forms → action=/proxy?url=<absolute>
+  $("form").each((_, el) => {
+    const $f = $(el);
+    const method = ($f.attr("method") || "GET").toUpperCase();
+    const action = $f.attr("action") || baseUrl;
+    const absAction = absolutize(action, baseUrl);
+    if (!absAction) return;
+
+    if (method === "GET") {
+      $f.attr("method", "POST");
+      $f.attr("action", "/proxy");
+      $f.prepend(
+        `<input type="hidden" name="url" value="${absAction.replace(
+          /"/g,
+          "&quot;"
+        )}">`
+      );
+    } else {
+      $f.attr("action", "/proxy?url=" + encodeURIComponent(absAction));
+    }
+  });
+
+  // Inject base URL + runtime shim at top of <head>
+  const shimTag =
+    `<script>window.__BROWSELY_BASE_URL__=${JSON.stringify(baseUrl)};</script>` +
+    `<script>${RUNTIME_SHIM}</script>`;
+
+  if ($("head").length) {
+    $("head").prepend(shimTag);
+  } else {
+    return shimTag + $.html();
+  }
+
+  return $.html();
+}
 
 app.listen(PORT, () => {
-  console.log(`Browsely proxy running on port ${PORT}`);
+  console.log(`Browsely US Proxy listening on :${PORT}`);
 });
