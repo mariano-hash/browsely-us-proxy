@@ -10,6 +10,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
+app.set("trust proxy", 1);
+
 const PORT = process.env.PORT || 8080;
 
 const SHIM = readFileSync(join(__dirname, "runtime-shim.js"), "utf8");
@@ -19,7 +21,6 @@ app.use(cookieParser());
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- CORS ----------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -32,12 +33,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Health ----------
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "Browsely US Proxy", media: true })
 );
 
-// ---------- Helpers ----------
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -64,9 +63,10 @@ function setBaseCookie(res, targetUrl) {
     const base = `${u.protocol}//${u.host}`;
     res.cookie("browsely_base", base, {
       httpOnly: false,
-      sameSite: "lax",
+      secure: true,
+      sameSite: "none",
       path: "/",
-      maxAge: 1000 * 60 * 60 * 6, // 6h
+      maxAge: 1000 * 60 * 60 * 6
     });
   } catch {
     /* ignore */
@@ -106,8 +106,9 @@ function rewriteHtml(html, baseUrl) {
     ["source", "src"],
     ["track", "src"],
     ["link", "href"],
-    ["script", "src"],
+    ["script", "src"]
   ];
+
   for (const [sel, attr] of assetSelectors) {
     $(sel).each((_, el) => {
       const v = $(el).attr(attr);
@@ -131,7 +132,6 @@ function rewriteHtml(html, baseUrl) {
     $(el).attr("srcset", rewritten);
   });
 
-  // Inject shim + base URL
   const inject = `<script>window.__BROWSELY_BASE_URL__=${JSON.stringify(
     baseUrl
   )};</script><script>${SHIM}</script>`;
@@ -141,22 +141,25 @@ function rewriteHtml(html, baseUrl) {
   } else {
     return inject + $.html();
   }
+
   return $.html();
 }
 
-// ---------- /proxy (GET + POST) ----------
 async function handleProxy(req, res, targetUrl, extraQuery) {
   if (!targetUrl) return res.status(400).send("Missing url");
 
   let finalUrl;
+
   try {
     const u = new URL(targetUrl);
+
     if (extraQuery) {
       for (const [k, v] of Object.entries(extraQuery)) {
         if (k === "url") continue;
         u.searchParams.append(k, String(v));
       }
     }
+
     finalUrl = u.toString();
   } catch {
     return res.status(400).send("Invalid url");
@@ -171,11 +174,10 @@ async function handleProxy(req, res, targetUrl, extraQuery) {
         "User-Agent": UA,
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
+        "Accept-Language": "en-US,en;q=0.9"
+      }
     });
 
-    // Manual redirect through /proxy
     if (upstream.status >= 300 && upstream.status < 400) {
       const loc = upstream.headers.get("location");
       if (loc) {
@@ -185,8 +187,8 @@ async function handleProxy(req, res, targetUrl, extraQuery) {
     }
 
     const ct = upstream.headers.get("content-type") || "";
+
     if (!/text\/html|application\/xhtml/i.test(ct)) {
-      // Non-HTML — stream via /asset semantics
       res.status(upstream.status);
       res.setHeader("Content-Type", ct || "application/octet-stream");
       const buf = Buffer.from(await upstream.arrayBuffer());
@@ -195,6 +197,7 @@ async function handleProxy(req, res, targetUrl, extraQuery) {
 
     const html = await upstream.text();
     const rewritten = rewriteHtml(html, finalUrl);
+
     res.status(upstream.status);
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -216,19 +219,21 @@ app.post("/proxy", (req, res) => {
   handleProxy(req, res, url, extras);
 });
 
-// ---------- /asset ----------
 app.get("/asset", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url");
+
   try {
     const upstream = await fetch(target, {
       headers: {
         "User-Agent": UA,
         ...(req.headers.range ? { Range: req.headers.range } : {}),
-        Referer: new URL(target).origin,
-      },
+        Referer: new URL(target).origin
+      }
     });
+
     res.status(upstream.status);
+
     [
       "content-type",
       "content-length",
@@ -236,11 +241,12 @@ app.get("/asset", async (req, res) => {
       "accept-ranges",
       "cache-control",
       "last-modified",
-      "etag",
+      "etag"
     ].forEach((h) => {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
     });
+
     const buf = Buffer.from(await upstream.arrayBuffer());
     res.end(buf);
   } catch (err) {
@@ -249,11 +255,7 @@ app.get("/asset", async (req, res) => {
   }
 });
 
-// ---------- Escaped-path recovery ----------
-// If the browser hits /search/foo, /video/123, etc. directly, reconstruct
-// using the browsely_base cookie set by the last /proxy load.
 app.use((req, res, next) => {
-  // Already handled routes
   if (
     req.path === "/" ||
     req.path === "/health" ||
@@ -264,6 +266,7 @@ app.use((req, res, next) => {
   }
 
   const base = req.cookies && req.cookies.browsely_base;
+
   if (!base) {
     return res
       .status(400)
