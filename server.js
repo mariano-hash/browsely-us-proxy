@@ -1,291 +1,255 @@
-// server.js — Browsely US Proxy (minimal safe + escaped-path recovery)
+// server.js — Browsely US Proxy (path-based context, no cookies)
 import express from "express";
 import * as cheerio from "cheerio";
-import cookieParser from "cookie-parser";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SHIM = readFileSync(join(__dirname, "runtime-shim.js"), "utf8");
 
 const app = express();
 app.set("trust proxy", 1);
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 8080;
+// ---------- helpers ----------
+const b64uEncode = (s) =>
+  Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const b64uDecode = (s) => {
+  s = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Buffer.from(s, "base64").toString("utf8");
+};
 
-const SHIM = readFileSync(join(__dirname, "runtime-shim.js"), "utf8");
+const toAbs = (base, val) => {
+  try { return new URL(val, base).toString(); } catch { return null; }
+};
+const isSkippable = (v) =>
+  !v || /^(data:|blob:|javascript:|about:|mailto:|tel:|#|vbscript:)/i.test(v.trim());
 
-app.disable("x-powered-by");
-app.use(cookieParser());
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
-app.use(express.json({ limit: "1mb" }));
+const proxyPath = (abs) => `/p/${b64uEncode(abs)}`;
+const assetPath = (abs) => `/a/${b64uEncode(abs)}`;
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, Content-Type"
-  );
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// Try to recover target from a "referer" header (escaped path case)
+function recoverFromReferer(req) {
+  const ref = req.get("referer");
+  if (!ref) return null;
+  try {
+    const u = new URL(ref);
+    const m = u.pathname.match(/^\/(p|a)\/([A-Za-z0-9_-]+)/);
+    if (!m) return null;
+    const refTarget = b64uDecode(m[2]);
+    return toAbs(refTarget, req.originalUrl);
+  } catch { return null; }
+}
 
+// ---------- health ----------
 app.get("/health", (_req, res) =>
   res.json({ ok: true, service: "Browsely US Proxy", media: true })
 );
+app.get("/", (_req, res) =>
+  res.type("text/plain").send("Browsely US Proxy — use /p/<base64url(target)>")
+);
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+// ---------- legacy compat: /proxy?url=... → /p/<b64> ----------
+app.get("/proxy", (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing ?url=");
+  return res.redirect(302, proxyPath(String(url)));
+});
+app.post("/proxy", (req, res) => {
+  const url = req.body?.url || req.query?.url;
+  if (!url) return res.status(400).send("Missing url");
+  return res.redirect(302, proxyPath(String(url)));
+});
 
-function toAbs(base, href) {
-  try {
-    return new URL(href, base).toString();
-  } catch {
-    return null;
-  }
-}
-
-function proxyUrl(abs) {
-  return `/proxy?url=${encodeURIComponent(abs)}`;
-}
-
-function assetUrl(abs) {
-  return `/asset?url=${encodeURIComponent(abs)}`;
-}
-
-function setBaseCookie(res, targetUrl) {
-  try {
-    const u = new URL(targetUrl);
-    const base = `${u.protocol}//${u.host}`;
-    res.cookie("browsely_base", base, {
-      httpOnly: false,
-      secure: true,
-      sameSite: "none",
-      path: "/",
-      maxAge: 1000 * 60 * 60 * 6
-    });
-  } catch {
-    /* ignore */
-  }
-}
-
+// ---------- HTML rewriter ----------
 function rewriteHtml(html, baseUrl) {
   const $ = cheerio.load(html, { decodeEntities: false });
 
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href");
-    if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
-    const abs = toAbs(baseUrl, href);
-    if (abs) $(el).attr("href", proxyUrl(abs));
-  });
+  // kill CSP / meta-refresh that could escape proxy
+  $('meta[http-equiv="content-security-policy" i]').remove();
+  $('meta[http-equiv="refresh" i]').remove();
+  $("base").remove();
 
-  $("form").each((_, el) => {
-    const $f = $(el);
-    const method = ($f.attr("method") || "GET").toUpperCase();
-    const action = $f.attr("action") || baseUrl;
-    const abs = toAbs(baseUrl, action);
-    if (!abs) return;
+  // force same-frame nav
+  $("a[target], form[target], area[target], base[target]").removeAttr("target");
 
-    if (method === "GET") {
-      $f.attr("method", "POST");
-      $f.attr("action", "/proxy");
-      $f.prepend(`<input type="hidden" name="url" value="${abs}">`);
-    } else {
-      $f.attr("action", proxyUrl(abs));
-    }
-  });
+  // remove SRI (we change bytes)
+  $("[integrity]").removeAttr("integrity");
+  $("[crossorigin]").removeAttr("crossorigin");
+  $("[nonce]").removeAttr("nonce");
 
-  const assetSelectors = [
-    ["img", "src"],
-    ["video", "src"],
-    ["audio", "src"],
-    ["source", "src"],
-    ["track", "src"],
-    ["link", "href"],
-    ["script", "src"]
-  ];
+  const rwAsset = (val) => {
+    if (isSkippable(val)) return val;
+    const abs = toAbs(baseUrl, val);
+    return abs ? assetPath(abs) : val;
+  };
+  const rwDoc = (val) => {
+    if (isSkippable(val)) return val;
+    const abs = toAbs(baseUrl, val);
+    return abs ? proxyPath(abs) : val;
+  };
 
-  for (const [sel, attr] of assetSelectors) {
-    $(sel).each((_, el) => {
+  // assets
+  ["src", "poster", "data", "background", "formaction"].forEach((attr) => {
+    $(`[${attr}]`).each((_, el) => {
       const v = $(el).attr(attr);
-      if (!v) return;
-      const abs = toAbs(baseUrl, v);
-      if (abs) $(el).attr(attr, assetUrl(abs));
+      if (v) $(el).attr(attr, rwAsset(v));
     });
-  }
+  });
 
+  // srcset
   $("[srcset]").each((_, el) => {
     const v = $(el).attr("srcset");
     if (!v) return;
-    const rewritten = v
-      .split(",")
-      .map((part) => {
-        const [u, d] = part.trim().split(/\s+/, 2);
-        const abs = toAbs(baseUrl, u);
-        return abs ? `${assetUrl(abs)}${d ? " " + d : ""}` : part;
-      })
-      .join(", ");
-    $(el).attr("srcset", rewritten);
+    $(el).attr(
+      "srcset",
+      v.split(",").map((p) => {
+        const t = p.trim().split(/\s+/);
+        if (!t[0]) return p;
+        const abs = toAbs(baseUrl, t[0]);
+        return abs ? [assetPath(abs), ...t.slice(1)].join(" ") : p;
+      }).join(", ")
+    );
   });
 
-  const inject = `<script>window.__BROWSELY_BASE_URL__=${JSON.stringify(
-    baseUrl
-  )};</script><script>${SHIM}</script>`;
+  // href / action — depends on tag
+  $("a[href], area[href]").each((_, el) => {
+    const v = $(el).attr("href");
+    if (v) $(el).attr("href", rwDoc(v));
+  });
+  $("link[href]").each((_, el) => {
+    const v = $(el).attr("href");
+    if (v) $(el).attr("href", rwAsset(v));
+  });
+  $("form").each((_, el) => {
+    const v = $(el).attr("action") || baseUrl;
+    $(el).attr("action", rwDoc(v));
+  });
 
-  if ($("head").length) {
-    $("head").prepend(inject);
-  } else {
-    return inject + $.html();
-  }
+  // inject runtime shim with the base
+  const shimCfg = `<script>window.__BROWSELY__=${JSON.stringify({ base: baseUrl })};</script>`;
+  const shimTag = `<script>${SHIM}</script>`;
+  const head = $("head");
+  if (head.length) head.prepend(shimCfg + shimTag);
+  else $.root().prepend("<head>" + shimCfg + shimTag + "</head>");
 
   return $.html();
 }
 
-async function handleProxy(req, res, targetUrl, extraQuery) {
-  if (!targetUrl) return res.status(400).send("Missing url");
-
-  let finalUrl;
-
-  try {
-    const u = new URL(targetUrl);
-
-    if (extraQuery) {
-      for (const [k, v] of Object.entries(extraQuery)) {
-        if (k === "url") continue;
-        u.searchParams.append(k, String(v));
-      }
-    }
-
-    finalUrl = u.toString();
-  } catch {
-    return res.status(400).send("Invalid url");
+// ---------- fetch + stream helper ----------
+async function fetchUpstream(targetUrl, req) {
+  const headers = {
+    "user-agent":
+      req.get("user-agent") ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "accept": req.get("accept") || "*/*",
+    "accept-language": req.get("accept-language") || "en-US,en;q=0.9",
+  };
+  const range = req.get("range");
+  if (range) headers["range"] = range;
+  const referer = req.get("referer");
+  if (referer) {
+    try {
+      const u = new URL(referer);
+      const m = u.pathname.match(/^\/(p|a)\/([A-Za-z0-9_-]+)/);
+      if (m) headers["referer"] = b64uDecode(m[2]);
+    } catch {}
   }
+  return fetch(targetUrl, { headers, redirect: "manual" });
+}
 
-  setBaseCookie(res, finalUrl);
+function passResponseHeaders(upstream, res) {
+  const drop = new Set([
+    "content-encoding", "content-length", "transfer-encoding",
+    "content-security-policy", "content-security-policy-report-only",
+    "x-frame-options", "strict-transport-security",
+    "cross-origin-opener-policy", "cross-origin-embedder-policy",
+    "cross-origin-resource-policy",
+  ]);
+  upstream.headers.forEach((v, k) => {
+    if (!drop.has(k.toLowerCase())) res.setHeader(k, v);
+  });
+}
+
+// ---------- /p/:b64 — document proxy ----------
+app.all(/^\/p\/([A-Za-z0-9_-]+)$/, async (req, res) => {
+  let target;
+  try { target = b64uDecode(req.params[0]); new URL(target); }
+  catch { return res.status(400).send("Bad target"); }
 
   try {
-    const upstream = await fetch(finalUrl, {
-      redirect: "manual",
-      headers: {
-        "User-Agent": UA,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
-      }
-    });
+    const upstream = await fetchUpstream(target, req);
 
-    if (upstream.status >= 300 && upstream.status < 400) {
-      const loc = upstream.headers.get("location");
-      if (loc) {
-        const abs = toAbs(finalUrl, loc);
-        if (abs) return res.redirect(302, proxyUrl(abs));
-      }
+    // follow redirects, re-wrapping the Location
+    if (upstream.status >= 300 && upstream.status < 400 && upstream.headers.get("location")) {
+      const next = toAbs(target, upstream.headers.get("location"));
+      if (next) return res.redirect(302, proxyPath(next));
     }
 
     const ct = upstream.headers.get("content-type") || "";
+    passResponseHeaders(upstream, res);
+    res.status(upstream.status);
 
-    if (!/text\/html|application\/xhtml/i.test(ct)) {
-      res.status(upstream.status);
-      res.setHeader("Content-Type", ct || "application/octet-stream");
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      return res.end(buf);
+    if (ct.includes("text/html")) {
+      const body = await upstream.text();
+      const html = rewriteHtml(body, target);
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      return res.send(html);
     }
-
-    const html = await upstream.text();
-    const rewritten = rewriteHtml(html, finalUrl);
-
-    res.status(upstream.status);
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store");
-    return res.end(rewritten);
-  } catch (err) {
-    console.error("[/proxy] error", err);
-    return res.status(502).send("Proxy fetch failed");
-  }
-}
-
-app.get("/proxy", (req, res) => {
-  handleProxy(req, res, req.query.url, req.query);
-});
-
-app.post("/proxy", (req, res) => {
-  const url = (req.body && req.body.url) || req.query.url;
-  const extras = { ...(req.body || {}), ...(req.query || {}) };
-  delete extras.url;
-  handleProxy(req, res, url, extras);
-});
-
-app.get("/asset", async (req, res) => {
-  const target = req.query.url;
-  if (!target) return res.status(400).send("Missing url");
-
-  try {
-    const upstream = await fetch(target, {
-      headers: {
-        "User-Agent": UA,
-        ...(req.headers.range ? { Range: req.headers.range } : {}),
-        Referer: new URL(target).origin
-      }
-    });
-
-    res.status(upstream.status);
-
-    [
-      "content-type",
-      "content-length",
-      "content-range",
-      "accept-ranges",
-      "cache-control",
-      "last-modified",
-      "etag"
-    ].forEach((h) => {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h, v);
-    });
-
+    // non-HTML doc response — stream through
     const buf = Buffer.from(await upstream.arrayBuffer());
-    res.end(buf);
-  } catch (err) {
-    console.error("[/asset] error", err);
-    res.status(502).send("Asset fetch failed");
+    return res.end(buf);
+  } catch (e) {
+    return res.status(502).send("Upstream error: " + e.message);
   }
 });
 
-app.use((req, res, next) => {
-  if (
-    req.path === "/" ||
-    req.path === "/health" ||
-    req.path === "/proxy" ||
-    req.path === "/asset"
-  ) {
-    return next();
-  }
-
-  const base = req.cookies && req.cookies.browsely_base;
-
-  if (!base) {
-    return res
-      .status(400)
-      .type("text/html")
-      .send(
-        `<h1>Browsely: lost context</h1>
-         <p>Cannot resolve <code>${req.originalUrl}</code> — no proxied site is active.</p>
-         <p>Open a URL through <code>/proxy?url=...</code> first.</p>`
-      );
-  }
-
+// ---------- /a/:b64 — asset proxy (with Range) ----------
+app.all(/^\/a\/([A-Za-z0-9_-]+)$/, async (req, res) => {
+  let target;
+  try { target = b64uDecode(req.params[0]); new URL(target); }
+  catch { return res.status(400).send("Bad asset"); }
   try {
-    const abs = new URL(req.originalUrl, base).toString();
-    return res.redirect(302, proxyUrl(abs));
-  } catch {
-    return res.status(400).send("Cannot reconstruct target URL");
+    const upstream = await fetchUpstream(target, req);
+    passResponseHeaders(upstream, res);
+    res.status(upstream.status);
+    if (!upstream.body) return res.end();
+    const reader = upstream.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+    res.end();
+  } catch (e) {
+    res.status(502).send("Asset error: " + e.message);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Browsely proxy listening on :${PORT}`);
+// legacy alias
+app.all("/asset", (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing ?url=");
+  return res.redirect(302, assetPath(String(url)));
 });
+
+// ---------- catch-all: escaped paths ----------
+// e.g. browser hits /search/milf directly; rebuild target from Referer.
+app.all("*", (req, res) => {
+  const recovered = recoverFromReferer(req);
+  if (recovered) return res.redirect(302, proxyPath(recovered));
+  res
+    .status(404)
+    .type("text/html")
+    .send(
+      `<h1>Browsely: lost context</h1>
+       <p>Cannot resolve <code>${req.originalUrl.replace(/</g, "&lt;")}</code>.</p>
+       <p>Open a site via <code>/p/&lt;base64url(target)&gt;</code> first.</p>`
+    );
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Browsely proxy on :${PORT}`));
